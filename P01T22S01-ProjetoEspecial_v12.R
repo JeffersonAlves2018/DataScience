@@ -1,0 +1,318 @@
+#getwd()
+#setwd('D:/DSA/Cursos/FCD/01_R_Azure/Top_22/Prj01/Workspace')
+
+# bibliotecas necessárias
+library(data.table)
+library(psych) 
+library(lubridate)
+library(class)
+
+library(plyr)
+library(tidyr)
+library(dplyr)
+
+library(plotly)
+library(ggplot2)
+
+source("Utils.R")
+
+library(caTools)
+library(gmodels)
+library(lattice)
+#library(e1071)
+#library(ISLR)
+library(ROCR)
+
+#devtools::install_version("rmarkdown", version = "1.8", repos = "http://cran.us.r-project.org")
+
+#----------------------------------------------------
+# 1. Coleta e Exploração de Dados
+#----------------------------------------------------
+system.time( df <- fread('train.csv', nrows = 300000) )
+write.csv(df, 'train_sample_fit.csv')
+str(df)
+head(df)
+
+
+# verificando "missing values"
+any(is.na(df))
+
+# analisando a estrutura e correlação das variáveis
+col_names <- c('ip', 'app', 'device', 'os', 'channel')
+cor(df[, col_names])
+
+# visualizando graficamente a distribuição por ip´s
+hist(df$ip)
+
+# visualizando graficamente os valores únicos por variáveis
+df_uniq <- as.vector(sapply(df[,c('app', 'os', 'device', 'channel')], function(x) as.numeric(length(unique(x)))))
+barplot(df_uniq, main = "Unique Values", xlab = "", ylab = "n", names.arg = c('app', 'os', 'device', 'channel'), col = "grey", border = 1, axis.lty = 1)
+
+# visualizando a correlação das variáveis pelos métodos pearson e spearman
+view_corr_lattice(df, col_names)
+
+
+# verificando as múltiplas ocorrências por ip e outras variáveis (app e channel)
+df_group <- df %>%
+  group_by(app, ip, channel) %>%
+  count(ip) %>% 
+  filter(app %in% c(1,2,3,8,9,12)) %>%
+  filter(n > 10)
+
+head(df_group)
+ggplot(df_group, aes(ip, n)) + geom_point() + facet_grid(. ~channel) + facet_wrap(~app)
+
+
+df_group2 <- df %>%
+  group_by(app, ip, channel, os, device) %>%
+  count(ip) %>%
+  filter(n > 10) %>%
+  filter(ip == 14901) %>%
+  arrange(ip, desc(n)) 
+
+df_group2 <- df_group2 %>% unite(df_group2, c('app', 'ip', 'channel', 'os', 'device'), sep = '_', remove = FALSE)
+colnames(df_group2)[1] <- "app_ip_channel_os_device"
+head(df_group2[,c(1,7)])
+
+ggplot(df_group2, aes(app_ip_channel_os_device, n)) + geom_point() + facet_grid(. ~app) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + coord_fixed(ratio = 0.4) + theme(axis.text.x = element_blank())
+
+
+# verificação do volume de acessos de um detereminado IP
+df_group3 <- df[,c('ip', 'click_time', 'is_attributed')]
+df_group3 <- df_group3 %>% separate(click_time, c('date', 'time'), sep = " ")
+df_group3[,'date'] <- as.POSIXct(df_group3$date)
+
+df_group4 <- df_group3 %>%
+  group_by(ip, time) %>%
+  filter(ip %in% c(198,203,209,279)) %>%
+  filter(is_attributed == 0) %>%
+  count(ip) %>%
+  arrange(ip, time, desc(n)) 
+
+head(df_group4)
+
+ggplot(df_group4, aes(x=time, y=n, group=1)) +
+  geom_point(stat='summary', fun.y=sum) +
+  # stat_summary(fun.y=sum, geom="line") +
+  stat_summary(fun.y=sum) +
+  geom_line(lty = "dotted", color = 'red') +
+  facet_wrap(. ~ip) +
+  theme(axis.text.x = element_blank())
+
+
+
+
+savehistory("dataout.txt") # salva o resultado do console
+
+#----------------------------------------------------
+# 2. Tratamento dos dados
+#----------------------------------------------------
+
+# criando uma coluna ID
+df <- mutate(df, click_id = row_number())
+
+# removendo a variável attributed_time
+df[,'attributed_time'] <- NULL
+
+# separando a variável click_time e verificando a necessidade de permanência da data
+df$date <-as.numeric(as.POSIXct(df$click_time))
+df$click_time <- NULL
+
+# criando a variável para predição
+df$is_attributed <- factor(df$is_attributed, levels = c(1, 0), labels = c("Legal", "Fraude"))
+str(df)
+
+# Rededfinindo a lista de varáveis de negócio relevantes
+col_names <- c('ip', 'app', 'device', 'os', 'channel', 'date')
+
+# Verificando a proporção
+round(prop.table(table(df$is_attributed)) * 100, digits = 1)
+
+# Normalizando os dados
+summary(df)
+df_norm <- as.data.frame(lapply(df[, col_names], normalize))
+summary(df_norm)
+
+# retorna as variáveis
+df_norm$is_attributed <-df$is_attributed 
+df_norm$click_id <- df$click_id
+str(df_norm)
+
+
+savehistory("dataout.txt") # salva o resultado do console
+
+
+#----------------------------------------------------
+# 3. Preparando os datasets para o modelo
+#----------------------------------------------------
+
+# define o índice das variáveis de predição e sequêncial
+idx_target <- grep("is_attributed", colnames(df_norm))
+idx_sequence <- grep("click_id", colnames(df_norm))
+
+# Criando as amostras de forma randômica
+df_sample <- get_dataset_train_test(df_norm, test_pct = 30, target_idx = idx_target, sequence_idx = idx_sequence)
+
+# Criando dados de treino
+df_train.data <- df_sample$traindata
+df_train.dir <- df_sample$traindir
+df_train.seq <- df_sample$trainseq
+
+# Criando dados de teste
+df_test.data <- df_sample$testdata
+df_test.dir <- df_sample$testdir
+df_test.seq <- df_sample$testseq
+
+# grava os dados da otimização
+write.csv(df_test.data, 'split_test_data_trei.csv')
+write.csv(df_test.dir, 'split_test_dir_trei.csv')
+write.csv(df_test.seq, 'split_test_seq_trei.csv')
+
+write.csv(df_train.data, 'split_train_data_trei.csv')
+write.csv(df_train.dir, 'split_train_dir_trei.csv')
+write.csv(df_train.seq, 'split_train_seq_trei.csv')
+
+
+# remove os datasets
+rm(df_amostra) 
+rm(df_norm)
+rm(df)
+rm(df_group)
+rm(df_group2)
+rm(df_group3)
+
+
+savehistory("dataout.txt") # salva o resultado do console
+
+#----------------------------------------------------
+# 4. Treinamento do Modelo 
+#----------------------------------------------------
+
+# Executando o modelo
+model_result <- knn(train = df_train.data,test = df_test.data,cl = df_train.dir,k = 20)
+
+
+#----------------------------------------------------
+# 5. Avaliação do Modelo 
+#----------------------------------------------------
+
+# Exibe os resultados da predição
+CrossTable(x = df_test.dir, y = model_result, prop.chisq = FALSE)
+
+sprintf("Taxa de acerto do Modelo: %s%%", round(mean(model_result == df_test.dir)*100, 2))
+
+# Interpretando os Resultados
+#
+# A tabela cruzada mostra 4 possíveis valores, que representam os falso/verdadeiro positivo e negativo. 
+#
+# A primeira coluna lista os labels originais nos dados observados e as duas colunas 
+# seguintes do modelo (Fraude e Legal), mostram os resultados da previsão.
+#
+# Temos:
+#  Cenário 1: Célula Legal (label)  x Legal (Modelo) - True Positive (Legal como Legal)
+#  Cenário 2: Célula Legal (label)  x Fraude (Modelo) - False Negative (Fraude como Legal)
+#  Cenário 3: Célula Fraude (label) x Legal (Modelo) - False Positive (Legal como Fraude)
+#  Cenário 4: Célula Fraude (label) x Fraude (Modelo) - True Negative (Fraude como Fraude)
+#
+# Lendo a Confusion Matrix (Perspectiva de ser um click fraudulento ou não):
+#  Falso Negativo = Click Fraude considerado incorretamente como Legal
+#  Falso Positivo = Click Legal considerado incorretamente como Fraude
+#  True Negative  = Click Fraude considerado corretamente como Fraude
+#  True Positive  = Click Legal considerado corretamente como Legal
+#
+
+
+#----------------------------------------------------
+# 6. Otimização do Modelo 
+#----------------------------------------------------
+
+# variável excluída
+col_names_excl <- c('os', 'date')
+idx_col_excl <- grep("os", colnames(df))
+df_excl <- df[,-idx_col_excl]
+
+# Redefinindo os índices
+idx_target <- grep("is_attributed", colnames(df_excl))
+idx_sequence <- grep("click_id", colnames(df_excl))
+
+# Padronizando o z-score
+df_norm_z <- as.data.frame(scale(df_excl[,-c(idx_target, idx_sequence)]))
+summary(df_norm_z)
+df_norm_z$is_attributed <- df_excl[,idx_target]
+df_norm_z$click_id <- df_excl[,idx_sequence]
+str(df_norm_z)
+
+# Redefinindo os índices
+idx_target <- grep("is_attributed", colnames(df_norm_z))
+idx_sequence <- grep("click_id", colnames(df_norm_z))
+
+# Criando as amostras de forma randômica
+df_sample <- get_dataset_train_test(df_norm_z, test_pct = 30, target_idx = idx_target, sequence_idx = idx_sequence)
+
+# Criando dados de treino
+df_train.data <- df_sample$traindata
+df_train.dir <- df_sample$traindir
+df_train.seq <- df_sample$trainseq
+
+# Criando dados de teste
+df_test.data <- df_sample$testdata
+df_test.dir <- df_sample$testdir
+df_test.seq <- df_sample$testseq
+
+# Executa a predição
+model_result.pred <- knn(train = df_train.data,test = df_test.data,cl = df_train.dir,k = 20, prob = TRUE)
+
+
+#----------------------------------------------------
+# 6. Avaliação dos Resultados e Taxa de Erro 
+#----------------------------------------------------
+
+# Exibe os resultados da predição
+CrossTable(x = df_test.dir, y = model_result.pred, prop.chisq = FALSE)
+
+sprintf("Taxa de acerto do Modelo: %s%%", round(mean(model_result.pred == df_test.dir)*100, 2))
+
+
+## Calculando a taxa de erro
+prev = NULL
+taxa_erro = NULL
+suppressWarnings(
+  for(i in 1:20){
+    set.seed(101)
+    prev <- knn(train = df_train.data,test = df_test.data,cl = df_train.dir,k = i)
+    taxa_erro[i] = mean(df_norm_z$is_attributed != prev)
+  })
+
+# Obtendo os valores de k e das taxas de erro
+k.values <- 1:20
+df_erro <- data.frame(taxa_erro, k.values)
+
+
+# A medida que o valor de k aumenta, a taxa de erro do modelo tende a diminir
+ggplot(df_erro, aes(x = k.values, y = taxa_erro)) + geom_point()+ geom_line(lty = "dotted", color = 'red')
+
+
+# Obtém os labels
+cl_res <- as.integer(df_test.dir)
+
+# Realiza uma conversão do objeto e um tratamento nos valores
+prob <- attr(model_result.pred, "prob")
+prob <- 2*ifelse(model_result.pred == -1, 1-prob, prob) - 1
+
+# Realiza uma predição dos valores, calcula a performance e plota o resultado
+pred_knn <- prediction(prob, cl_res)
+pred_knn <- performance(pred_knn, "tpr", "fpr")
+plot(pred_knn, avg= "threshold", colorize=T, lwd=3, main="ROC Curve")
+
+
+# grava os dados da otimização
+write.csv(df_test.data, 'split_test_data_otim.csv')
+write.csv(df_test.dir, 'split_test_dir_otim.csv')
+write.csv(df_test.seq, 'split_test_seq_otim.csv')
+
+write.csv(df_train.data, 'split_train_data_otim.csv')
+write.csv(df_train.dir, 'split_train_dir_otim.csv')
+write.csv(df_train.seq, 'split_train_seq_otim.csv')
+
+
+
