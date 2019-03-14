@@ -1,0 +1,371 @@
+---
+title: "Projeto Especial 2"
+author: "Jefferson Alves"
+date: "27 de fevereiro de 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Projeto Especial 2 - Prevendo Demanda de Estoque com Base em Vendas
+
+Este projeto tem como objetivo desenvolver um modelo de aprendizado de máquina para prever com precisão a demanda de estoque com base nos dados históricos de vendas de um grande grupo empresarial denominado Grupo Bimbo (https://www.grupobimbo.com). 
+
+Para maiores detalhes sobre os dados utlilizados neste projeto, consulte o link <https://www.kaggle.com/c/grupo-bimbo-inventory-demand>.
+
+
+Todo o projeto será descrito de acordo com suas etapas. 
+
+## Etapa 1 - Coleta dos Dados
+
+```{r caminho, echo=FALSE}
+setwd("D:/DSA/Cursos/FCD/01_R_Azure/Top_22/Prj02/Workspace")
+```
+
+```{r bibliotecas, include=FALSE, echo=FALSE, results='hide', warning=FALSE}
+library(data.table)
+library(sqldf)
+library(tibble)
+library(psych) 
+
+library(tidyr)
+library(dplyr)
+library(plyr)
+
+library(reshape2)
+library(plotly)
+library(class)
+
+library(ggpubr)
+library(lattice)
+library(e1071)
+library(jtools)
+library(ggplot2)
+library(gridExtra)
+library(kableExtra)
+library(rhandsontable)
+
+library(DAAG)
+
+source("D:/DSA/Cursos/FCD/01_R_Azure/Top_22/Prj02/Workspace/Utils.R")
+```
+
+Devido a restrições de memória, optou-se por usar parcialmente os dados dos arquivos 'train.csv' e 'test.csv'. 
+
+```{r coleta, include=FALSE, echo=FALSE, results='hide', warning=FALSE}
+system.time( df_train <- fread('D:/DSA/Cursos/FCD/01_R_Azure/Top_22/Prj02/Workspace/train.csv', nrows = 500000) )
+system.time( df_test <- fread('D:/DSA/Cursos/FCD/01_R_Azure/Top_22/Prj02/Workspace/test.csv', nrows = 100000) )
+
+write.csv(df, 'D:/DSA/Cursos/FCD/01_R_Azure/Top_22/Prj02/Workspace/train_sample_fit.csv')
+write.csv(df, 'D:/DSA/Cursos/FCD/01_R_Azure/Top_22/Prj02/Workspace/test_sample_fit.csv')
+```
+
+Logo abaixo está a descrição dos campos, onde cada registro representa um consumode produto por um cliente num canal de vendas num dado momento de tempo e proveniente de uma entrega originada de um depósito.
+
+- Semana — Week number (From Thursday to Wednesday)
+- Agencia_ID — Sales Depot ID
+- Canal_ID — Sales Channel ID
+- Ruta_SAK — Route ID (Several routes = Sales Depot)
+- Cliente_ID — Client ID
+- NombreCliente — Client name
+- Producto_ID — Product ID
+- NombreProducto — Product Name
+- Venta_uni_hoy — Sales unit this week (integer)
+- Venta_hoy — Sales this week (unit: pesos)
+- Dev_uni_proxima — Returns unit next week (integer)
+- Dev_proxima — Returns next week (unit: pesos)
+- Demanda_uni_equil — Adjusted Demand (integer) (This is the target you will predict)
+
+* foram preservados os nomes e descrições originais do dataset
+
+Estrutura do dataset de treino:
+```{r estrutura-arq-1}
+glimpse(df_train)
+```
+
+Estrutura do dataset de teste:
+```{r estrutura-arq-2}
+glimpse(df_test)
+```
+
+Abaixo algumas considerações importantes sobre o projeto:
+
+1. Como o estudo visa analisar a questão do atendimento a demanda dos produtos (variáveis Agencia_ID,
+Canal_ID e Producto_ID) e não outros aspectos tais como logístico (variável Ruta_SAK) e perfil consumidor (variável Cliente_ID), foram consideradas inicialmente apenas as seguintes variáveis para a criação do modelo:
+
+- Semana — Week number (From Thursday to Wednesday)
+- Agencia_ID — Sales Depot ID
+- Canal_ID — Sales Channel ID
+- Producto_ID — Product ID
+- Venta_uni_hoy — Sales unit this week (integer)
+- Dev_uni_proxima — Returns unit next week (integer)
+- Demanda_uni_equil — Adjusted Demand (integer) (target will be predict)
+
+2. Como não existe demanda negativa para um produto, haverá um ajuste para 0 (zero) quando o cálculo da demanda (Venta_uni_hoy - Dev_uni_proxima) for negativo;
+
+3. Os produtos contidos no dataset de teste e ausentes no dataset de treino deverão ser inseridos neste
+útlimo com demanda 0 (zero), observando as particularidades (Agencia_ID, Canal_ID, Cliente_ID e Ruta_SAK), pois assim estará assegurado ao modelo o conhecimento da existência destes mesmo que a previsão de demanda não atenda as expectativas uma vez que a séria histórica de demanda será praticamente inexistente;
+
+## Etapa 2 - Exploração dos Dados
+
+Após verificar a existência ou não de "missing values" em ambos os datasets, foi realizada uma análise da distribuição das demais variáveis do dataset de treino. 
+
+```{r exploracao-miss, warning=FALSE}
+# verificando "missing values" nos dataset´s de treino e teste
+any(is.na(df_train))
+any(is.na(df_test))
+```
+
+Foi realizada uma análise gráfica de correlação entre algumas variáveis de negócio consideradas mais relevantes num primeiro momento, permitindo identificar visualmente um indício de possível relacionamento entre elas. 
+
+Para essa análise de correlação, foram utilizados os métodos pearson e spearman. Pelo método de pearson, identificou-se um nível de correlação expressivo entre a maioria das variáveis, exceto a variável "Semana" e "Agencia_ID" que podem ser candidatas a exclusão na fase de otimização do modelo.
+
+```{r exploracao-hist, echo=FALSE, warning=FALSE, message=FALSE}
+# df_train -> analisando a estrutura e correlação das variáveis
+col_names <- c('Semana', 'Agencia_ID', 'Canal_ID', 'Ruta_SAK', 'Cliente_ID', 'Producto_ID')
+view_corr_lattice(df_train, names(df_train)[1:6])
+```
+
+Abaixo estão alguns gráficos de distribuição das variáveis de negócio, ratificando a percepção de tratamento de algumas variáveis e exclusão de outras além da necessidade de normalização dados.
+```{r exploracao-distr, echo=FALSE, warning=FALSE}
+# visualizando graficamente a distribuição
+ggarrange(histogram(df_train$Semana), 
+          histogram(df_train$Agencia_ID), 
+          histogram(df_train$Canal_ID), 
+          histogram(df_train$Ruta_SAK), 
+          histogram(df_train$Cliente_ID), 
+          histogram(df_train$Producto_ID), 
+          nrow = 3, ncol = 2
+)
+```
+
+A partir das análises abaixo da variável "Demanda_uni_equil", identificou-se a presença de outliers e uma grande concentração de valores numa determinada faixa, reforçando a necessidade de normalização dos dados.
+```{r exploracao-dens, echo=FALSE, warning=FALSE}
+# visualizando:
+#  1. A relação entre a variável Canal_ID e Demanda_uni_equil
+#  2. A densidade da variável Demanda_uni_equil e a necessidade de tratamento futuro
+par(mfrow=c(1, 2))
+scatter.smooth(x=df_train$Canal_ID, y=df_train$Demanda_uni_equil)
+plot(density(df_train$Demanda_uni_equil), main="Density Plot: Demand", ylab="Frequency")
+polygon(density(df_train$Demanda_uni_equil), col="red")
+```
+
+Foram observadas poucas ocorrências de valores únicos para determinadas varáveis, reforçando a percepção de tratamento de algumas variáveis e exclusão de outras.
+```{r exploracao-unique, echo=FALSE, warning=FALSE}
+# visualizando graficamente os valores únicos por variáveis
+df_uniq <- as.vector(sapply(df_train[,c('Semana', 'Agencia_ID', 'Canal_ID', 'Ruta_SAK', 'Cliente_ID', 'Producto_ID')], function(x) as.numeric(length(unique(x)))))
+df_bar <- barplot(df_uniq, main = "Unique Values", xlab = "", ylab = "n", names.arg = c('Semana', 'Agencia_ID', 'Canal_ID', 'Ruta_SAK', 'Cliente_ID', 'Producto_ID'), col = c("grey", "blue", "red", "purple", "green", "yellow"), border = 1, axis.lty = 1, log = "y")
+text(df_bar, 0.5, paste("n = ", df_uniq,sep=""), cex=1, pos = 2, adj = 3) 
+```
+
+Considerando o objetivo principal que é prever a demanda dos produtos por depósito e a análise de 
+correlação entre as variáveis, optou-se por gerar um dataset contendo apenas algumas variáveis.
+```{r exploracao-grupo-1, echo=FALSE, warning=FALSE}
+# visualizando a demanda de produto por Produto_ID
+dg01 <- sqldf("SELECT 
+                Producto_ID, Agencia_ID, Canal_ID, sum(Demanda_uni_equil) as Demanda_uni_equil
+            FROM 
+                df_train
+            WHERE
+              Producto_ID BETWEEN 100 AND 700
+            GROUP BY 
+                Producto_ID, Agencia_ID, Canal_ID
+            ORDER BY
+                Producto_ID, Agencia_ID, Canal_ID, Demanda_uni_equil desc")
+
+ggplot(dg01, aes(Producto_ID, Demanda_uni_equil, group=1)) + geom_point() +   facet_grid(. ~Canal_ID) 
+```
+
+
+## Etapa 3 - Tratamento dos Dados
+
+Os datasets de treino e teste foram readequados de forma a ficarem com a estrutura semelhante.
+```{r tratamento-0, echo=FALSE, warning=FALSE, results=FALSE}
+# criando uma  variavel ID no dataset df_train
+df_train <- mutate(df_train, id = row_number())
+
+# criando a variável Demanda_uni_equil no dataset test
+df_test$Demanda_uni_equil <- 0
+
+# realiza o cálculo da demanda com base nas vendas desta semana e o retorno de produto da próxima
+df_train$Demanda_uni_equil <- (df_train$Venta_uni_hoy - df_train$Dev_uni_proxima) 
+df_train$Demanda_uni_equil <- ifelse(df_train$Demanda_uni_equil < 0, 0, df_train$Demanda_uni_equil)
+#head(df_train[df_train$Demanda_uni_equil < 0,])
+
+# remove as variaveis utilizadas no cálculo
+df_train$Venta_uni_hoy <- NULL
+df_train$Dev_uni_proxima <- NULL
+
+# armazena a variável ID dos dataset.s e remove as originais 
+df_train_seq <- df_train$id
+df_train$id <- NULL
+
+df_test_seq <- df_test$id
+df_test$id <- NULL
+
+# conforme considerações iniciais, serão todas as variáveis que não fazem parte do objetivo principal
+df_train$Venta_hoy <-NULL
+df_train$Dev_proxima <-NULL
+```
+
+Dataset de treino:
+```{r tratamento-1-train, warning=FALSE}
+glimpse(df_train)
+```
+
+Dataset de teste:
+```{r tratamento-1-test, warning=FALSE}
+glimpse(df_test)
+```
+
+```{r tratamento-2, echo=FALSE, warning=FALSE, results=FALSE}
+# identifica os produtos do dataset de teste ausentes no dataset de treino 
+df_prod <- anti_join(df_test, df_train, by = 'Producto_ID')
+df_uniq <- as.vector(sapply(df_prod[,c('Semana', 'Agencia_ID', 'Canal_ID', 'Ruta_SAK', 'Cliente_ID', 'Producto_ID')], function(x) as.numeric(length(unique(x)))))
+```
+
+```{r tratamento-3, echo=FALSE, warning=FALSE}
+sprintf("Foram identificados %d produtos nos dados de teste e que estão fora dos dados de treino.", as.vector(df_uniq)[6], 2)
+```
+
+Logo abaixo está uma visualização dos valores únicos para os dados de teste que deverão ser inseridos no dataset de treino.
+```{r tratamento-4, echo=FALSE, warning=FALSE}
+df_bar <- barplot(df_uniq, main = "Unique Values", xlab = "", ylab = "n", names.arg = c('Semana', 'Agencia_ID', 'Canal_ID', 'Ruta_SAK', 'Cliente_ID', 'Producto_ID'), col = c("grey", "blue", "red", "purple", "green", "yellow"), border = 1, axis.lty = 1, log = "y")
+text(df_bar, 0.5, paste("n = ", df_uniq,sep=""), cex=1, pos = 3, adj = 4) 
+```
+
+```{r tratamento-5, echo=FALSE, warning=FALSE, results=FALSE}
+# insere os produtos ausentes no dataset de treino 
+df_train <- rbind.data.frame(df_train, df_prod)
+```
+
+```{r tratamento-6, echo=FALSE, warning=FALSE, results=FALSE}
+# removendo os dataset´s
+rm(df_prod)
+rm(df_uniq)
+rm(df_bar)
+
+# definindo o conjunto de variáveis
+df_cols <- c('Semana', 'Agencia_ID', 'Canal_ID', 'Ruta_SAK', 'Cliente_ID', 'Producto_ID')
+```
+
+Tanto os dados de treino quanto de teste precisarão ser normalizados antes da fase de treinamento do modelo preditivo, conforme constatado abaixo.
+
+Dataset de treino antes da normalização:
+```{r tratamento-7, echo=FALSE, warning=FALSE}
+# Normalizando os dados de treino
+df_train_norm <- df_train
+summary(df_train_norm[,c('Semana', 'Agencia_ID', 'Canal_ID')])
+```
+
+Dataset de treino após normalização:
+```{r tratamento-7-norm, echo=FALSE, warning=FALSE}
+df_train_norm <- as.data.frame(lapply(df_train[, df_cols], normalize))
+summary(df_train_norm[,c('Semana', 'Agencia_ID', 'Canal_ID')])
+df_train_norm$Demanda_uni_equil <- df_train$Demanda_uni_equil
+```
+
+Dataset de teste antes da normalização:
+```{r tratamento-8, echo=FALSE, warning=FALSE}
+# Normalizando os dados de teste
+df_test_norm <- df_test
+summary(df_test_norm[,c('Semana', 'Agencia_ID', 'Canal_ID')])
+```
+
+Dataset de teste após normalização:
+```{r tratamento-8-norm, echo=FALSE, warning=FALSE}
+summary(df_test_norm[,c('Semana', 'Agencia_ID', 'Canal_ID')])
+df_test_norm$Demanda_uni_equil <- df_test$Demanda_uni_equil
+```
+
+## Etapa 4 - Treinamento e Otimização do Modelo
+
+Após o tratamento e normalização dos dados parciais contidos nos dataset´s de treino e teste, será realizado o processo de treinamento do modelo preditivo via técnica de Regressão Linear.
+
+No primeiro modelo, optou-se por manter todas as variáveis de negócio, apesar dos indícios de correlação de algumas, de forma a ter um parâmetro inicial de comparativo de performance do modelo.
+```{r treinamento-modelo-1, warning=FALSE, render='normal_print'}
+# Criando o modelo de regressão - v01
+formula.init.v01 <- "Demanda_uni_equil ~ ."
+formula.init.v01 <- as.formula(formula.init.v01)
+lr.model_v01 <- lm(formula = formula.init.v01, data = df_train_norm)
+
+# Visualizando os detalhes do modelo
+summ(lr.model_v01, n.sd = 2, robust = "HC1")
+```
+
+```{r otimizacao-modelo-2, warning=FALSE}
+# Criando o modelo de regressão - v02
+formula.init.v02 <- "Demanda_uni_equil ~ Semana + Cliente_ID + Canal_ID + Ruta_SAK + Producto_ID"
+formula.init.v02 <- as.formula(formula.init.v02)
+lr.model_v02 <- lm(formula = formula.init.v02, data = df_train_norm)
+```
+
+```{r otimizacao-modelo-3, warning=FALSE}
+# Criando o modelo de regressão - v03
+formula.init.v03 <- "Demanda_uni_equil ~ Cliente_ID + Ruta_SAK + Producto_ID"
+formula.init.v03 <- as.formula(formula.init.v03)
+lr.model_v03 <- lm(formula = formula.init.v03, data = df_train_norm)
+```
+
+```{r otimizacao-modelo-4, warning=FALSE}
+# Criando o modelo de regressão - v04
+formula.init.v04 <- "Demanda_uni_equil ~ Canal_ID + Ruta_SAK + Producto_ID"
+formula.init.v04 <- as.formula(formula.init.v04)
+lr.model_v04 <- lm(formula = formula.init.v04, data = df_train_norm)
+```
+
+## Etapa 5 - Avaliação dos Resultados da Otimização do Modelo
+
+O gráfico abaixo mostra o desvio das variáveis contidas em cada um dos modelos gerados, possibilitando identificar visualmente qual modelo pode escolhido para ser usado na predição. 
+```{r avaliacao-1-otimizacao, echo=FALSE, warning=FALSE}
+# comparando os modelos
+plot_summs(lr.model_v01, lr.model_v02, lr.model_v03, lr.model_v04, scale = TRUE, plot.distributions = TRUE)
+```
+
+Analisando os resultados abaixo, identificou-se o Modelo 2 com um desempenho superior, pois apesar do R2 igual ao Modelo 1, apresentou um F-statistics melhor para a principal variável de negócio ("Producto_ID").
+```{r avaliacao-2-modelos, echo=FALSE, warning=FALSE, results='asis'}
+# comparando os modelos
+export_summs(lr.model_v01, lr.model_v02, lr.model_v03, lr.model_v04, scale = TRUE,   error_format = "({statistic})")
+```
+
+
+## Etapa 6 - Execução do Modelo Preditivo e Avaliação dos Resultados
+
+```{r execucao-1, echo=FALSE, warning=FALSE}
+# escolhendo o modelo e aplicando aos dados de teste
+lr.model.pred <- predict.lm(lr.model_v02, df_test_norm, interval = "predict") #prediction
+as.tibble(head(lr.model.pred))
+summary(lr.model.pred)
+```
+
+```{r avaliacao-1-erro, echo=FALSE, warning=FALSE, results=FALSE}
+# verificando o erro
+df_erro <-as.data.frame(cbind(lr.model.pred))
+df_erro$demanda <- 0
+
+# verifica a demanda e ajusta o indicador
+df_erro$demanda <- ifelse(df_erro$fit < 0, -1, df_erro$demanda)
+df_erro$demanda <- ifelse(df_erro$fit > 0, 1, df_erro$demanda)
+df_erro$demanda <- ifelse(df_erro$fit == 0, 0, df_erro$demanda)
+
+# Verificando a proporção
+df_erro$demanda <- factor(df_erro$demanda, levels = c(1, 0, -1), labels = c("Positiva (> 0)", "Nula (=0)", "Negativa (<0)"))
+```
+
+```{r avaliacao-2-erro, echo=FALSE, warning=FALSE}
+# exibe a taxa de acerto
+df_taxa_acerto <- round(prop.table(table(df_erro$demanda)) * 100, digits = 1)
+sprintf("Conforme tabela abaixo, a Taxa de Acerto do Modelo: %.2f%%", round(as.vector(df_taxa_acerto)[1], digits = 2), 2)
+```
+
+```{r avaliacao-3, echo=FALSE, warning=FALSE}
+# exibe o resultado formatado
+df_taxa_acerto <- as.data.frame(df_taxa_acerto)
+colnames(df_taxa_acerto)[1] <- 'Demanda Apurada'
+colnames(df_taxa_acerto)[2] <- '%'
+
+rhandsontable(df_taxa_acerto, rowHeaders = NULL)
+#gridExtra::grid.table(df_taxa_acerto)
+```
